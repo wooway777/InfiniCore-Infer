@@ -77,10 +77,102 @@ class LlamaWeightsNaming:
     def down(self, i):
         return f"model.layers.{i}.mlp.down_proj.weight"
 
-    def match(state_dict):
+    def match(self, state_dict):
         return (
             "model.norm.weight" in state_dict
             and "model.layers.0.self_attn.q_proj.weight" in state_dict
+        )
+
+
+class GPTQWeightsNaming(LlamaWeightsNaming):
+    def attn_q(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.qweight"
+
+    def attn_k(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.qweight"
+
+    def attn_v(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.qweight"
+
+    def attn_o(self, i):
+        return f"model.layers.{i}.self_attn.o_proj.qweight"
+
+    def gate(self, i):
+        return f"model.layers.{i}.mlp.gate_proj.qweight"
+
+    def up(self, i):
+        return f"model.layers.{i}.mlp.up_proj.qweight"
+
+    def down(self, i):
+        return f"model.layers.{i}.mlp.down_proj.qweight"
+
+    def attn_q_scales(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.scales"
+
+    def attn_k_scales(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.scales"
+
+    def attn_v_scales(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.scales"
+
+    def attn_o_scales(self, i):
+        return f"model.layers.{i}.self_attn.o_proj.scales"
+
+    def gate_scales(self, i):
+        return f"model.layers.{i}.mlp.gate_proj.scales"
+
+    def up_scales(self, i):
+        return f"model.layers.{i}.mlp.up_proj.scales"
+
+    def down_scales(self, i):
+        return f"model.layers.{i}.mlp.down_proj.scales"
+
+    def attn_q_qzeros(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.qzeros"
+
+    def attn_k_qzeros(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.qzeros"
+
+    def attn_v_qzeros(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.qzeros"
+
+    def attn_o_qzeros(self, i):
+        return f"model.layers.{i}.self_attn.o_proj.qzeros"
+
+    def gate_qzeros(self, i):
+        return f"model.layers.{i}.mlp.gate_proj.qzeros"
+
+    def up_qzeros(self, i):
+        return f"model.layers.{i}.mlp.up_proj.qzeros"
+
+    def down_qzeros(self, i):
+        return f"model.layers.{i}.mlp.down_proj.qzeros"
+
+    def attn_q_g_idx(self, i):
+        return f"model.layers.{i}.self_attn.q_proj.g_idx"
+
+    def attn_k_g_idx(self, i):
+        return f"model.layers.{i}.self_attn.k_proj.g_idx"
+
+    def attn_v_g_idx(self, i):
+        return f"model.layers.{i}.self_attn.v_proj.g_idx"
+
+    def attn_o_g_idx(self, i):
+        return f"model.layers.{i}.self_attn.o_proj.g_idx"
+
+    def gate_g_idx(self, i):
+        return f"model.layers.{i}.mlp.gate_proj.g_idx"
+
+    def up_g_idx(self, i):
+        return f"model.layers.{i}.mlp.up_proj.g_idx"
+
+    def down_g_idx(self, i):
+        return f"model.layers.{i}.mlp.down_proj.g_idx"
+
+    def match(self, state_dict):
+        return (
+            "model.norm.weight" in state_dict
+            and "model.layers.0.self_attn.q_proj.qweight" in state_dict
         )
 
 
@@ -147,6 +239,8 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         torch_dt_norm=torch.float32,
         ndev=1,
         transpose_weight=True,
+        is_quantized=False,
+        quantization_config=None,
     ):
         nlayer = meta.nlayer
         nh = meta.nh
@@ -163,6 +257,25 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         assert nkvh % ndev == 0
         assert di % ndev == 0
         torch_dt_logits = meta.torch_dtype_logits
+        
+        self.is_quantized = is_quantized
+        if is_quantized:
+            self.bits = quantization_config.get("bits", 8)
+            self.group_size = quantization_config.get("group_size", 128)
+            self.symmetric = quantization_config.get("sym", True)
+            self.dt_qweight = DataType.INFINI_DTYPE_U8
+            self.dt_scales = DataType.INFINI_DTYPE_F16
+            self.dt_qzeros = DataType.INFINI_DTYPE_U8
+            self.dt_g_idx = DataType.INFINI_DTYPE_I32
+        else:
+            self.bits = 0
+            self.group_size = 0
+            self.symmetric = False
+            self.dt_qweight = DataType.INFINI_DTYPE_INVALID
+            self.dt_scales = DataType.INFINI_DTYPE_INVALID
+            self.dt_qzeros = DataType.INFINI_DTYPE_INVALID
+            self.dt_g_idx = DataType.INFINI_DTYPE_INVALID
+
         if torch_dt_mat == torch.float16:
             self.dt_mat = DataType.INFINI_DTYPE_F16
         elif torch_dt_mat == torch.float32:
@@ -352,6 +465,74 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         self.ffn_down_ptrs = [self.ffn_down_tensor[i].data_ptr() for i in range(nlayer)]
         self.ffn_down = (c_void_p * nlayer)(*self.ffn_down_ptrs)
 
+        # Initialize quantized weights if needed
+        if is_quantized and isinstance(naming, GPTQWeightsNaming):
+            # Initialize quantized attention weights
+            self.attn_qkv_qweight = (c_void_p * nlayer)()
+            self.attn_qkv_scales = (c_void_p * nlayer)()
+            self.attn_qkv_qzeros = (c_void_p * nlayer)()
+            self.attn_qkv_g_idx = (c_void_p * nlayer)()
+            
+            self.attn_o_qweight = (c_void_p * nlayer)()
+            self.attn_o_scales = (c_void_p * nlayer)()
+            self.attn_o_qzeros = (c_void_p * nlayer)()
+            self.attn_o_g_idx = (c_void_p * nlayer)()
+            
+            self.ffn_gate_up_qweight = (c_void_p * nlayer)()
+            self.ffn_gate_up_scales = (c_void_p * nlayer)()
+            self.ffn_gate_up_qzeros = (c_void_p * nlayer)()
+            self.ffn_gate_up_g_idx = (c_void_p * nlayer)()
+            
+            self.ffn_down_qweight = (c_void_p * nlayer)()
+            self.ffn_down_scales = (c_void_p * nlayer)()
+            self.ffn_down_qzeros = (c_void_p * nlayer)()
+            self.ffn_down_g_idx = (c_void_p * nlayer)()
+            
+            for i in range(nlayer):
+                # Attention QKV
+                qweight = state_dict[naming.attn_q(i)].to(torch.uint8)
+                scales = state_dict[naming.attn_q_scales(i)].to(torch.float16)
+                qzeros = state_dict[naming.attn_q_qzeros(i)].to(torch.uint8)
+                g_idx = state_dict[naming.attn_q_g_idx(i)].to(torch.int32)
+                
+                self.attn_qkv_qweight[i] = qweight.data_ptr()
+                self.attn_qkv_scales[i] = scales.data_ptr()
+                self.attn_qkv_qzeros[i] = qzeros.data_ptr()
+                self.attn_qkv_g_idx[i] = g_idx.data_ptr()
+                
+                # Attention O
+                qweight = state_dict[naming.attn_o(i)].to(torch.uint8)
+                scales = state_dict[naming.attn_o_scales(i)].to(torch.float16)
+                qzeros = state_dict[naming.attn_o_qzeros(i)].to(torch.uint8)
+                g_idx = state_dict[naming.attn_o_g_idx(i)].to(torch.int32)
+                
+                self.attn_o_qweight[i] = qweight.data_ptr()
+                self.attn_o_scales[i] = scales.data_ptr()
+                self.attn_o_qzeros[i] = qzeros.data_ptr()
+                self.attn_o_g_idx[i] = g_idx.data_ptr()
+                
+                # FFN Gate Up
+                qweight = state_dict[naming.gate(i)].to(torch.uint8)
+                scales = state_dict[naming.gate_scales(i)].to(torch.float16)
+                qzeros = state_dict[naming.gate_qzeros(i)].to(torch.uint8)
+                g_idx = state_dict[naming.gate_g_idx(i)].to(torch.int32)
+                
+                self.ffn_gate_up_qweight[i] = qweight.data_ptr()
+                self.ffn_gate_up_scales[i] = scales.data_ptr()
+                self.ffn_gate_up_qzeros[i] = qzeros.data_ptr()
+                self.ffn_gate_up_g_idx[i] = g_idx.data_ptr()
+                
+                # FFN Down
+                qweight = state_dict[naming.down(i)].to(torch.uint8)
+                scales = state_dict[naming.down_scales(i)].to(torch.float16)
+                qzeros = state_dict[naming.down_qzeros(i)].to(torch.uint8)
+                g_idx = state_dict[naming.down_g_idx(i)].to(torch.int32)
+                
+                self.ffn_down_qweight[i] = qweight.data_ptr()
+                self.ffn_down_scales[i] = scales.data_ptr()
+                self.ffn_down_qzeros[i] = qzeros.data_ptr()
+                self.ffn_down_g_idx[i] = g_idx.data_ptr()
+
 
 class JiugeBatchedTask:
     def __init__(self, tasks: List[InferTask]):
@@ -414,6 +595,11 @@ class JiugeForCauslLM:
             config = json.load(f)
             self.config = config
             self.model_type = config["model_type"]
+        
+        # Check if model is quantized
+        is_quantized = "quantization_config" in config
+        quantization_config = config.get("quantization_config", {})
+        
         eos_token_id = self.config["eos_token_id"]
         self.eos_token_id = (
             [eos_token_id] if type(eos_token_id) == int else eos_token_id
@@ -421,6 +607,7 @@ class JiugeForCauslLM:
         transpose_weight = (
             device != DeviceType.DEVICE_TYPE_ASCEND
         )  # y = xW is faster than y=xW^T on Ascend
+        
         if "llama" == config["model_type"]:
             model = (
                 transformers.LlamaForCausalLM.from_pretrained(model_dir_path)
@@ -435,6 +622,8 @@ class JiugeForCauslLM:
                 model.state_dict(),
                 ndev=ndev,
                 transpose_weight=transpose_weight,
+                is_quantized=is_quantized,
+                quantization_config=quantization_config,
             )
         elif "fm9g" == config["model_type"] or "minicpm" == config["model_type"]:
             if any(
@@ -447,14 +636,17 @@ class JiugeForCauslLM:
                     weights_only=True,
                     map_location="cpu",
                 )
-            if LlamaWeightsNaming.match(state_dict):
+            naming = GPTQWeightsNaming() if is_quantized else LlamaWeightsNaming()
+            if naming.match(state_dict):
                 self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
                 self.weights = JiugeWeightsImpl(
                     self.meta,
-                    LlamaWeightsNaming(),
+                    naming,
                     state_dict,
                     ndev=ndev,
                     transpose_weight=transpose_weight,
+                    is_quantized=is_quantized,
+                    quantization_config=quantization_config,
                 )
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path, trust_remote_code=True
@@ -472,14 +664,17 @@ class JiugeForCauslLM:
                     weights_only=True,
                     map_location="cpu",
                 )
-            if LlamaWeightsNaming.match(state_dict):
+            naming = GPTQWeightsNaming() if is_quantized else LlamaWeightsNaming()
+            if naming.match(state_dict):
                 self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
                 self.weights = JiugeWeightsImpl(
                     self.meta,
-                    LlamaWeightsNaming(),
+                    naming,
                     state_dict,
                     ndev=ndev,
                     transpose_weight=transpose_weight,
+                    is_quantized=is_quantized,
+                    quantization_config=quantization_config,
                 )
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path, trust_remote_code=True
@@ -488,14 +683,17 @@ class JiugeForCauslLM:
                 raise ValueError("Unsupported weight naming")
         elif "qwen2" == config["model_type"]:
             state_dict = load_all_safetensors_from_dir(model_dir_path)
-            if LlamaWeightsNaming.match(state_dict):
+            naming = GPTQWeightsNaming() if is_quantized else LlamaWeightsNaming()
+            if naming.match(state_dict):
                 self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
                 self.weights = JiugeWeightsImpl(
                     self.meta,
-                    LlamaWeightsNaming(),
+                    naming,
                     state_dict,
                     ndev=ndev,
                     transpose_weight=transpose_weight,
+                    is_quantized=is_quantized,
+                    quantization_config=quantization_config,
                 )
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path
