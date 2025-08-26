@@ -27,6 +27,7 @@ import json
 import math
 import torch
 import transformers
+import numpy as np
 
 torch.set_default_device("cpu")
 
@@ -78,9 +79,10 @@ class LlamaWeightsNaming:
         return f"model.layers.{i}.mlp.down_proj.weight"
 
     def match(self, state_dict):
-        return (
-            "model.norm.weight" in state_dict
-            and "model.layers.0.self_attn.q_proj.weight" in state_dict
+        # Check for either full precision or quantized weights
+        return "model.norm.weight" in state_dict and (
+            "model.layers.0.self_attn.q_proj.weight" in state_dict
+            or "model.layers.0.self_attn.q_proj.qweight" in state_dict
         )
 
 
@@ -257,7 +259,7 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         assert nkvh % ndev == 0
         assert di % ndev == 0
         torch_dt_logits = meta.torch_dtype_logits
-        
+
         self.is_quantized = is_quantized
         if is_quantized:
             self.bits = quantization_config.get("bits", 8)
@@ -328,143 +330,6 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         ]
         self.attn_norm = (c_void_p * nlayer)(*self.attn_norm_ptrs)
 
-        def qkv_slices(_i):
-            _Q = (
-                state_dict[naming.attn_q(_i)]
-                .reshape([nh, 2, dh // 2, d])
-                .transpose(1, 2)
-            )
-            _K = (
-                state_dict[naming.attn_k(_i)]
-                .reshape([nkvh, 2, dh // 2, d])
-                .transpose(1, 2)
-            )
-            _V = state_dict[naming.attn_v(_i)].reshape([nkvh, dh // 2, 2, d])
-            _result = []
-            _nh = nh // ndev
-            _nkvh = nkvh // ndev
-            for _idev in range(ndev):
-                _result.append(_Q[_idev * _nh : (_idev + 1) * _nh, :, :, :])
-                _result.append(_K[_idev * _nkvh : (_idev + 1) * _nkvh, :, :, :])
-                _result.append(_V[_idev * _nkvh : (_idev + 1) * _nkvh, :, :])
-            return _result
-
-        self.qkv_tensor = [
-            torch.concat(qkv_slices(i)).to(torch_dt_mat) for i in range(nlayer)
-        ]
-        if not transpose_weight:
-            for i in range(nlayer):
-                self.qkv_tensor[i] = (
-                    self.qkv_tensor[i]
-                    .reshape(ndev, (nh + 2 * nkvh) // ndev * dh, d)
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-        self.qkv_tensor_ptrs = [self.qkv_tensor[i].data_ptr() for i in range(nlayer)]
-        self.attn_qkv = (c_void_p * nlayer)(*self.qkv_tensor_ptrs)
-
-        def qkv_b_slices(_i):
-            _QB = (
-                state_dict[naming.attn_q_b(_i)]
-                .reshape([nh, 2, dh // 2])
-                .transpose(1, 2)
-            )
-            _KB = (
-                state_dict[naming.attn_k_b(_i)]
-                .reshape([nkvh, 2, dh // 2])
-                .transpose(1, 2)
-            )
-            _VB = state_dict[naming.attn_v_b(_i)].reshape([nkvh, dh // 2, 2])
-            _result = []
-            _nh = nh // ndev
-            _nkvh = nkvh // ndev
-            for _idev in range(ndev):
-                _result.append(_QB[_idev * _nh : (_idev + 1) * _nh, :, :].flatten())
-                _result.append(_KB[_idev * _nkvh : (_idev + 1) * _nkvh, :, :].flatten())
-                _result.append(_VB[_idev * _nkvh : (_idev + 1) * _nkvh, :, :].flatten())
-            return _result
-
-        if naming.attn_q_b(0) in state_dict:
-            self.qkv_b_tensors = [
-                torch.concat(qkv_b_slices(i)).to(torch_dt_logits) for i in range(nlayer)
-            ]
-            self.qkv_b_tensor_ptrs = [
-                self.qkv_b_tensors[i].data_ptr() for i in range(nlayer)
-            ]
-            self.attn_qkv_b = (c_void_p * nlayer)(*self.qkv_b_tensor_ptrs)
-        else:
-            self.attn_qkv_b = None
-
-        self.attn_o_tensor = [
-            (
-                state_dict[naming.attn_o(i)]
-                .to(torch_dt_mat)
-                .reshape([d, ndev, nh // ndev * dh])
-                .transpose(0, 1)
-                .contiguous()
-                if transpose_weight
-                else state_dict[naming.attn_o(i)]
-                .transpose(0, 1)
-                .to(torch_dt_mat)
-                .contiguous()
-            )
-            * scale_o
-            for i in range(nlayer)
-        ]
-        self.attn_o_ptrs = [self.attn_o_tensor[i].data_ptr() for i in range(nlayer)]
-        self.attn_o = (c_void_p * nlayer)(*self.attn_o_ptrs)
-
-        self.ffn_norm_tensors = [
-            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-        ]
-        self.ffn_norm_ptrs = [
-            self.ffn_norm_tensors[i].data_ptr() for i in range(nlayer)
-        ]
-        self.ffn_norm = (c_void_p * nlayer)(*self.ffn_norm_ptrs)
-
-        def gate_up_slices(_i):
-            _result = []
-            _di = di // ndev
-            for _idev in range(ndev):
-                _start = _idev * _di
-                _end = (_idev + 1) * _di
-                _result.append(state_dict[naming.gate(_i)][_start:_end, :])
-                _result.append(state_dict[naming.up(_i)][_start:_end, :])
-            return _result
-
-        self.gate_up_tensors = [
-            torch.concat(gate_up_slices(i)).to(torch_dt_mat) for i in range(nlayer)
-        ]
-        if not transpose_weight:
-            for i in range(nlayer):
-                self.gate_up_tensors[i] = (
-                    self.gate_up_tensors[i]
-                    .reshape(ndev, 2 * di // ndev, d)
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-        self.gate_up_ptrs = [self.gate_up_tensors[i].data_ptr() for i in range(nlayer)]
-        self.ffn_gate_up = (c_void_p * nlayer)(*self.gate_up_ptrs)
-
-        self.ffn_down_tensor = [
-            (
-                state_dict[naming.down(i)]
-                .to(torch_dt_mat)
-                .reshape([d, ndev, di // ndev])
-                .transpose(0, 1)
-                .contiguous()
-                if transpose_weight
-                else state_dict[naming.down(i)]
-                .transpose(0, 1)
-                .to(torch_dt_mat)
-                .contiguous()
-            )
-            * scale_down
-            for i in range(nlayer)
-        ]
-        self.ffn_down_ptrs = [self.ffn_down_tensor[i].data_ptr() for i in range(nlayer)]
-        self.ffn_down = (c_void_p * nlayer)(*self.ffn_down_ptrs)
-
         # Initialize quantized weights if needed
         if is_quantized and isinstance(naming, GPTQWeightsNaming):
             # Initialize quantized attention weights
@@ -472,66 +337,242 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             self.attn_qkv_scales = (c_void_p * nlayer)()
             self.attn_qkv_qzeros = (c_void_p * nlayer)()
             self.attn_qkv_g_idx = (c_void_p * nlayer)()
-            
+
             self.attn_o_qweight = (c_void_p * nlayer)()
             self.attn_o_scales = (c_void_p * nlayer)()
             self.attn_o_qzeros = (c_void_p * nlayer)()
             self.attn_o_g_idx = (c_void_p * nlayer)()
-            
+
             self.ffn_gate_up_qweight = (c_void_p * nlayer)()
             self.ffn_gate_up_scales = (c_void_p * nlayer)()
             self.ffn_gate_up_qzeros = (c_void_p * nlayer)()
             self.ffn_gate_up_g_idx = (c_void_p * nlayer)()
-            
+
             self.ffn_down_qweight = (c_void_p * nlayer)()
             self.ffn_down_scales = (c_void_p * nlayer)()
             self.ffn_down_qzeros = (c_void_p * nlayer)()
             self.ffn_down_g_idx = (c_void_p * nlayer)()
-            
+
             for i in range(nlayer):
                 # Attention QKV
                 qweight = state_dict[naming.attn_q(i)].to(torch.uint8)
                 scales = state_dict[naming.attn_q_scales(i)].to(torch.float16)
                 qzeros = state_dict[naming.attn_q_qzeros(i)].to(torch.uint8)
                 g_idx = state_dict[naming.attn_q_g_idx(i)].to(torch.int32)
-                
+
                 self.attn_qkv_qweight[i] = qweight.data_ptr()
                 self.attn_qkv_scales[i] = scales.data_ptr()
                 self.attn_qkv_qzeros[i] = qzeros.data_ptr()
                 self.attn_qkv_g_idx[i] = g_idx.data_ptr()
-                
+
                 # Attention O
                 qweight = state_dict[naming.attn_o(i)].to(torch.uint8)
                 scales = state_dict[naming.attn_o_scales(i)].to(torch.float16)
                 qzeros = state_dict[naming.attn_o_qzeros(i)].to(torch.uint8)
                 g_idx = state_dict[naming.attn_o_g_idx(i)].to(torch.int32)
-                
+
                 self.attn_o_qweight[i] = qweight.data_ptr()
                 self.attn_o_scales[i] = scales.data_ptr()
                 self.attn_o_qzeros[i] = qzeros.data_ptr()
                 self.attn_o_g_idx[i] = g_idx.data_ptr()
-                
+
                 # FFN Gate Up
                 qweight = state_dict[naming.gate(i)].to(torch.uint8)
                 scales = state_dict[naming.gate_scales(i)].to(torch.float16)
                 qzeros = state_dict[naming.gate_qzeros(i)].to(torch.uint8)
                 g_idx = state_dict[naming.gate_g_idx(i)].to(torch.int32)
-                
+
                 self.ffn_gate_up_qweight[i] = qweight.data_ptr()
                 self.ffn_gate_up_scales[i] = scales.data_ptr()
                 self.ffn_gate_up_qzeros[i] = qzeros.data_ptr()
                 self.ffn_gate_up_g_idx[i] = g_idx.data_ptr()
-                
+
                 # FFN Down
                 qweight = state_dict[naming.down(i)].to(torch.uint8)
                 scales = state_dict[naming.down_scales(i)].to(torch.float16)
                 qzeros = state_dict[naming.down_qzeros(i)].to(torch.uint8)
                 g_idx = state_dict[naming.down_g_idx(i)].to(torch.int32)
-                
+
                 self.ffn_down_qweight[i] = qweight.data_ptr()
                 self.ffn_down_scales[i] = scales.data_ptr()
                 self.ffn_down_qzeros[i] = qzeros.data_ptr()
                 self.ffn_down_g_idx[i] = g_idx.data_ptr()
+
+            # For quantized models, we don't need to initialize the full-precision weights
+            self.attn_qkv = (c_void_p * nlayer)()
+            self.attn_qkv_b = None
+            self.attn_o = (c_void_p * nlayer)()
+            self.ffn_gate_up = (c_void_p * nlayer)()
+            self.ffn_down = (c_void_p * nlayer)()
+
+            # Initialize bias tensors if they exist
+            if naming.attn_q_b(0) in state_dict:
+                self.qkv_b_tensors = [
+                    torch.concat(
+                        [
+                            state_dict[naming.attn_q_b(i)].flatten(),
+                            state_dict[naming.attn_k_b(i)].flatten(),
+                            state_dict[naming.attn_v_b(i)].flatten(),
+                        ]
+                    ).to(torch_dt_logits)
+                    for i in range(nlayer)
+                ]
+                self.qkv_b_tensor_ptrs = [
+                    self.qkv_b_tensors[i].data_ptr() for i in range(nlayer)
+                ]
+                self.attn_qkv_b = (c_void_p * nlayer)(*self.qkv_b_tensor_ptrs)
+            else:
+                self.attn_qkv_b = None
+        else:
+            # Original full-precision implementation
+            def qkv_slices(_i):
+                _Q = (
+                    state_dict[naming.attn_q(_i)]
+                    .reshape([nh, 2, dh // 2, d])
+                    .transpose(1, 2)
+                )
+                _K = (
+                    state_dict[naming.attn_k(_i)]
+                    .reshape([nkvh, 2, dh // 2, d])
+                    .transpose(1, 2)
+                )
+                _V = state_dict[naming.attn_v(_i)].reshape([nkvh, dh // 2, 2, d])
+                _result = []
+                _nh = nh // ndev
+                _nkvh = nkvh // ndev
+                for _idev in range(ndev):
+                    _result.append(_Q[_idev * _nh : (_idev + 1) * _nh, :, :, :])
+                    _result.append(_K[_idev * _nkvh : (_idev + 1) * _nkvh, :, :, :])
+                    _result.append(_V[_idev * _nkvh : (_idev + 1) * _nkvh, :, :])
+                return _result
+
+            self.qkv_tensor = [
+                torch.concat(qkv_slices(i)).to(torch_dt_mat) for i in range(nlayer)
+            ]
+            if not transpose_weight:
+                for i in range(nlayer):
+                    self.qkv_tensor[i] = (
+                        self.qkv_tensor[i]
+                        .reshape(ndev, (nh + 2 * nkvh) // ndev * dh, d)
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+            self.qkv_tensor_ptrs = [
+                self.qkv_tensor[i].data_ptr() for i in range(nlayer)
+            ]
+            self.attn_qkv = (c_void_p * nlayer)(*self.qkv_tensor_ptrs)
+
+            def qkv_b_slices(_i):
+                _QB = (
+                    state_dict[naming.attn_q_b(_i)]
+                    .reshape([nh, 2, dh // 2])
+                    .transpose(1, 2)
+                )
+                _KB = (
+                    state_dict[naming.attn_k_b(_i)]
+                    .reshape([nkvh, 2, dh // 2])
+                    .transpose(1, 2)
+                )
+                _VB = state_dict[naming.attn_v_b(_i)].reshape([nkvh, dh // 2, 2])
+                _result = []
+                _nh = nh // ndev
+                _nkvh = nkvh // ndev
+                for _idev in range(ndev):
+                    _result.append(_QB[_idev * _nh : (_idev + 1) * _nh, :, :].flatten())
+                    _result.append(
+                        _KB[_idev * _nkvh : (_idev + 1) * _nkvh, :, :].flatten()
+                    )
+                    _result.append(
+                        _VB[_idev * _nkvh : (_idev + 1) * _nkvh, :, :].flatten()
+                    )
+                return _result
+
+            if naming.attn_q_b(0) in state_dict:
+                self.qkv_b_tensors = [
+                    torch.concat(qkv_b_slices(i)).to(torch_dt_logits)
+                    for i in range(nlayer)
+                ]
+                self.qkv_b_tensor_ptrs = [
+                    self.qkv_b_tensors[i].data_ptr() for i in range(nlayer)
+                ]
+                self.attn_qkv_b = (c_void_p * nlayer)(*self.qkv_b_tensor_ptrs)
+            else:
+                self.attn_qkv_b = None
+
+            self.attn_o_tensor = [
+                (
+                    state_dict[naming.attn_o(i)]
+                    .to(torch_dt_mat)
+                    .reshape([d, ndev, nh // ndev * dh])
+                    .transpose(0, 1)
+                    .contiguous()
+                    if transpose_weight
+                    else state_dict[naming.attn_o(i)]
+                    .transpose(0, 1)
+                    .to(torch_dt_mat)
+                    .contiguous()
+                )
+                * scale_o
+                for i in range(nlayer)
+            ]
+            self.attn_o_ptrs = [self.attn_o_tensor[i].data_ptr() for i in range(nlayer)]
+            self.attn_o = (c_void_p * nlayer)(*self.attn_o_ptrs)
+
+            def gate_up_slices(_i):
+                _result = []
+                _di = di // ndev
+                for _idev in range(ndev):
+                    _start = _idev * _di
+                    _end = (_idev + 1) * _di
+                    _result.append(state_dict[naming.gate(_i)][_start:_end, :])
+                    _result.append(state_dict[naming.up(_i)][_start:_end, :])
+                return _result
+
+            self.gate_up_tensors = [
+                torch.concat(gate_up_slices(i)).to(torch_dt_mat) for i in range(nlayer)
+            ]
+            if not transpose_weight:
+                for i in range(nlayer):
+                    self.gate_up_tensors[i] = (
+                        self.gate_up_tensors[i]
+                        .reshape(ndev, 2 * di // ndev, d)
+                        .transpose(1, 2)
+                        .contiguous()
+                    )
+            self.gate_up_ptrs = [
+                self.gate_up_tensors[i].data_ptr() for i in range(nlayer)
+            ]
+            self.ffn_gate_up = (c_void_p * nlayer)(*self.gate_up_ptrs)
+
+            self.ffn_down_tensor = [
+                (
+                    state_dict[naming.down(i)]
+                    .to(torch_dt_mat)
+                    .reshape([d, ndev, di // ndev])
+                    .transpose(0, 1)
+                    .contiguous()
+                    if transpose_weight
+                    else state_dict[naming.down(i)]
+                    .transpose(0, 1)
+                    .to(torch_dt_mat)
+                    .contiguous()
+                )
+                * scale_down
+                for i in range(nlayer)
+            ]
+            self.ffn_down_ptrs = [
+                self.ffn_down_tensor[i].data_ptr() for i in range(nlayer)
+            ]
+            self.ffn_down = (c_void_p * nlayer)(*self.ffn_down_ptrs)
+
+        # Common initialization for both quantized and full-precision
+        self.ffn_norm_tensors = [
+            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
+        ]
+        self.ffn_norm_ptrs = [
+            self.ffn_norm_tensors[i].data_ptr() for i in range(nlayer)
+        ]
+        self.ffn_norm = (c_void_p * nlayer)(*self.ffn_norm_ptrs)
 
 
 class JiugeBatchedTask:
@@ -595,11 +636,11 @@ class JiugeForCauslLM:
             config = json.load(f)
             self.config = config
             self.model_type = config["model_type"]
-        
+
         # Check if model is quantized
         is_quantized = "quantization_config" in config
         quantization_config = config.get("quantization_config", {})
-        
+
         eos_token_id = self.config["eos_token_id"]
         self.eos_token_id = (
             [eos_token_id] if type(eos_token_id) == int else eos_token_id
@@ -607,7 +648,7 @@ class JiugeForCauslLM:
         transpose_weight = (
             device != DeviceType.DEVICE_TYPE_ASCEND
         )  # y = xW is faster than y=xW^T on Ascend
-        
+
         if "llama" == config["model_type"]:
             model = (
                 transformers.LlamaForCausalLM.from_pretrained(model_dir_path)
@@ -767,9 +808,7 @@ class JiugeForCauslLM:
             if self.model_type == "qwen2":
                 token_piece = self.tokenizer.convert_ids_to_tokens(output_tokens[0])
                 output_str = (
-                    piece_to_text(token_piece)                    
-                    .replace("▁", " ")
-                    .replace("<0x0A>", "\n")
+                    piece_to_text(token_piece).replace("▁", " ").replace("<0x0A>", "\n")
                 )
             else:
                 output_str = (
