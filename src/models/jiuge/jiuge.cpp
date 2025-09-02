@@ -413,6 +413,8 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
+
+        // logits_in->debug("name.bin");
     }
     // Sample and Output
     if (idev == 0) {

@@ -332,7 +332,8 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         # Initialize quantized weights if needed
         if is_quantized and isinstance(naming, GPTQWeightsNaming):
             if self.bits == 8:
-                self._init_quantized_weights_i8(
+                # self._init_quantized_weights_i8(
+                self._init_quantized_weights_i8_naive(
                     naming,
                     state_dict,
                     nlayer,
@@ -372,8 +373,8 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             self.ffn_norm_tensors[i].data_ptr() for i in range(nlayer)
         ]
         self.ffn_norm = (c_void_p * nlayer)(*self.ffn_norm_ptrs)
-
-    def _init_quantized_weights_i8(
+    
+    def _init_quantized_weights_i8_naive(
         self,
         naming,
         state_dict,
@@ -388,417 +389,241 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         scale_o,
         scale_down,
     ):
-        """Initialize quantized weights with RoPE-friendly QKV concatenation"""
-        # Initialize all pointers
-        self.attn_qkv_qweight = (c_void_p * nlayer)()
-        self.attn_qkv_scales = (c_void_p * nlayer)()
-        self.attn_qkv_qzeros = (c_void_p * nlayer)()
-        self.attn_qkv_g_idx = (c_void_p * nlayer)()
-        self.attn_o_qweight = (c_void_p * nlayer)()
-        self.attn_o_scales = (c_void_p * nlayer)()
-        self.attn_o_qzeros = (c_void_p * nlayer)()
-        self.attn_o_g_idx = (c_void_p * nlayer)()
-        self.ffn_gate_up_qweight = (c_void_p * nlayer)()
-        self.ffn_gate_up_scales = (c_void_p * nlayer)()
-        self.ffn_gate_up_qzeros = (c_void_p * nlayer)()
-        self.ffn_gate_up_g_idx = (c_void_p * nlayer)()
-        self.ffn_down_qweight = (c_void_p * nlayer)()
-        self.ffn_down_scales = (c_void_p * nlayer)()
-        self.ffn_down_qzeros = (c_void_p * nlayer)()
-        self.ffn_down_g_idx = (c_void_p * nlayer)()
-
-        # Temporary lists to hold tensors
-        attn_qkv_qweights = []
-        attn_qkv_scales_list = []
-        attn_qkv_qzeros_list = []
-        attn_qkv_g_idx_list = []
-        attn_o_qweights = []
-        attn_o_scales_list = []
-        attn_o_qzeros_list = []
-        attn_o_g_idx_list = []
-        ffn_gate_up_qweights = []
-        ffn_gate_up_scales_list = []
-        ffn_gate_up_qzeros_list = []
-        ffn_gate_up_g_idx_list = []
-        ffn_down_qweights = []
-        ffn_down_scales_list = []
-        ffn_down_qzeros_list = []
-        ffn_down_g_idx_list = []
-
+        """Initialize quantized weights by dequantizing them to full precision"""
+        # Initialize all tensors as empty lists
+        self.attn_q_tensors = []
+        self.attn_k_tensors = []
+        self.attn_v_tensors = []
+        self.attn_o_tensors = []
+        self.gate_tensors = []
+        self.up_tensors = []
+        self.down_tensors = []
+        
+        # Check if bias terms exist and initialize them if they do
+        self.has_bias = naming.attn_q_b(0) in state_dict
+        if self.has_bias:
+            self.attn_q_b_tensors = []
+            self.attn_k_b_tensors = []
+            self.attn_v_b_tensors = []
+        
+        # First, make sure all norm tensors are initialized
+        torch_dt_norm = self.output_norm_tensor.dtype
+        self.attn_norm_tensors = [
+            state_dict[naming.attn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
+        ]
+        self.ffn_norm_tensors = [
+            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
+        ]
         print(f"nh: {nh}, nkvh: {nkvh}, dh: {dh}, d: {d}")
-
-        def qkv_qweight_slices(_i):
-            """Helper function to get QKV qweight slices for each device"""
-            q_qweight = state_dict[naming.attn_q_qweight(_i)]
-            k_qweight = state_dict[naming.attn_k_qweight(_i)]
-            v_qweight = state_dict[naming.attn_v_qweight(_i)]
-            print(f"  Q qweight: shape={q_qweight.shape}, dtype={q_qweight.dtype}")
-            print(f"  K qweight: shape={k_qweight.shape}, dtype={k_qweight.dtype}")
-            print(f"  V qweight: shape={v_qweight.shape}, dtype={v_qweight.dtype}")
-            print(f"  Q qweight view: shape={q_qweight.view(torch.uint8).shape}, dtype={q_qweight.view(torch.uint8).dtype}")
-            print(f"  K qweight view: shape={k_qweight.view(torch.uint8).shape}, dtype={k_qweight.view(torch.uint8).dtype}")
-            print(f"  V qweight view: shape={v_qweight.view(torch.uint8).shape}, dtype={v_qweight.view(torch.uint8).dtype}")
-
-            # UNPACK int32 to int8 (4 int8 values packed into each int32)
-            def unpack_int32_to_int8(tensor):
-                # Reshape to [..., 4] to separate the packed bytes
-                unpacked = tensor.view(torch.uint8).reshape(*tensor.shape, 4)
-                # Convert to int8 (subtract 128 to get signed int8 range [-128, 127])
-                return unpacked.to(torch.int8) - 128
-            
-            q_qweight = unpack_int32_to_int8(q_qweight)
-            k_qweight = unpack_int32_to_int8(k_qweight)
-            v_qweight = unpack_int32_to_int8(v_qweight)
-            print(f"  After unpacking - Q: {q_qweight.shape}, K: {k_qweight.shape}, V: {v_qweight.shape}")
-
-            q_qweight = q_qweight.reshape([nh, dh // 4, d, 4]).permute(0, 1, 3, 2).reshape([nh, dh, d])
-            k_qweight = k_qweight.reshape([nkvh, dh // 4, d, 4]).permute(0, 1, 3, 2).reshape([nkvh, dh, d])
-            v_qweight = v_qweight.reshape([nkvh, dh // 4, d, 4]).permute(0, 1, 3, 2).reshape([nkvh, dh, d])
-            print(f"  After reshaping - Q: {q_qweight.shape}, K: {k_qweight.shape}, V: {v_qweight.shape}")
-            
-            # Reshape for RoPE-friendly concatenation
-            q_qweight = q_qweight.reshape([nh, 2, dh // 2, d]).transpose(1, 2)
-            k_qweight = k_qweight.reshape([nkvh, 2, dh // 2, d]).transpose(1, 2)
-            v_qweight = v_qweight.reshape([nkvh, dh // 2, 2, d])
-            print(f"  After RoPE reshape - Q: {q_qweight.shape}, K: {k_qweight.shape}, V: {v_qweight.shape}")
-            
-            result = []
-            nh_per_dev = nh // ndev
-            nkvh_per_dev = nkvh // ndev
-            for idev in range(ndev):
-                result.append(q_qweight[idev * nh_per_dev : (idev + 1) * nh_per_dev, :, :, :])
-                result.append(k_qweight[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :])
-                result.append(v_qweight[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :])
-            return result
-
-        def qkv_scales_slices(_i):
-            q_scales = state_dict[naming.attn_q_scales(_i)] # Shape: [N, num_groups]
-            k_scales = state_dict[naming.attn_k_scales(_i)]
-            v_scales = state_dict[naming.attn_v_scales(_i)]
-            print(f"  scales shapes - Q:{q_scales.shape}, K:{k_scales.shape}, V:{v_scales.shape}")
-
-            result = []
-            # Assuming the model uses tensor parallelism along the N dimension
-            n_per_dev = d // ndev # 'n' is the size of the output dimension N
-            for idev in range(ndev):
-                # Slice the output dimension (N) for each device
-                start_idx = idev * n_per_dev
-                end_idx = (idev + 1) * n_per_dev
-                result.append(q_scales[start_idx:end_idx, :])
-                result.append(k_scales[start_idx:end_idx, :])
-                result.append(v_scales[start_idx:end_idx, :])
-            return result
-
-        def qkv_qzeros_slices(_i):
-            q_qzeros = state_dict[naming.attn_q_qzeros(_i)] # Shape: [N, num_groups]
-            k_qzeros = state_dict[naming.attn_k_qzeros(_i)]
-            v_qzeros = state_dict[naming.attn_v_qzeros(_i)]
-            print(f"  qzeros shapes - Q:{q_qzeros.shape}, K:{k_qzeros.shape}, V:{v_qzeros.shape}")
-
-            # First, UNPACK qzeros (each uint32 contains 4 uint8 zeros)
-            def unpack_qzeros(tensor):
-                # tensor shape: [N, num_groups]
-                unpacked = tensor.view(torch.uint8).reshape(*tensor.shape, 4)
-                return unpacked # Shape becomes [N, num_groups, 4], dtype=uint8
-
-            q_qzeros = unpack_qzeros(q_qzeros)
-            k_qzeros = unpack_qzeros(k_qzeros)
-            v_qzeros = unpack_qzeros(v_qzeros)
-
-            result = []
-            n_per_dev = d // ndev
-            for idev in range(ndev):
-                start_idx = idev * n_per_dev
-                end_idx = (idev + 1) * n_per_dev
-                result.append(q_qzeros[start_idx:end_idx, :, :])
-                result.append(k_qzeros[start_idx:end_idx, :, :])
-                result.append(v_qzeros[start_idx:end_idx, :, :])
-            return result
-
-        def qkv_g_idx_slices(_i):
-            q_g_idx = state_dict[naming.attn_q_g_idx(_i)] # Shape: [K_q]
-            k_g_idx = state_dict[naming.attn_k_g_idx(_i)] # Shape: [K_k]
-            v_g_idx = state_dict[naming.attn_v_g_idx(_i)] # Shape: [K_v]
-            print(f"  g_idx shapes - Q:{q_g_idx.shape}, K:{k_g_idx.shape}, V:{v_g_idx.shape}")
-
-            # 处理 Q g_idx
-            # Q权重形状: [nh*dh, n] = [14*64=896, 896]
-            q_g_idx_reshaped = q_g_idx.reshape([nh, dh])
-            q_g_idx_reshaped = q_g_idx_reshaped.reshape([nh, 2, dh // 2])
-            q_g_idx_reshaped = q_g_idx_reshaped.transpose(1, 2) # New shape: [nh, dh//2, 2]
-            q_g_idx = q_g_idx_reshaped.reshape(-1)
-
-            # 处理 K g_idx
-            # K权重形状: [nkvh*dh, n] = [2*64=128, 128]
-            # 但这里g_idx是[896]，说明可能有错误或者需要特殊处理
-            # 检查实际尺寸
-            expected_k_size = nkvh * dh  # 2 * 64 = 128
-            if len(k_g_idx) != expected_k_size:
-                print(f"WARNING: K g_idx size {len(k_g_idx)} doesn't match expected {expected_k_size}")
-                # 可能需要截断或复制来匹配
-                if len(k_g_idx) > expected_k_size:
-                    k_g_idx = k_g_idx[:expected_k_size]
-                else:
-                    # 如果太小，可能需要重复填充（但这种情况不太可能）
-                    repeats = expected_k_size // len(k_g_idx)
-                    k_g_idx = k_g_idx.repeat(repeats)
-            
-            k_g_idx_reshaped = k_g_idx.reshape([nkvh, dh])
-            k_g_idx_reshaped = k_g_idx_reshaped.reshape([nkvh, 2, dh // 2])
-            k_g_idx_reshaped = k_g_idx_reshaped.transpose(1, 2)
-            k_g_idx = k_g_idx_reshaped.reshape(-1)
-
-            # 处理 V g_idx (同样的问题)
-            expected_v_size = nkvh * dh  # 2 * 64 = 128
-            if len(v_g_idx) != expected_v_size:
-                print(f"WARNING: V g_idx size {len(v_g_idx)} doesn't match expected {expected_v_size}")
-                if len(v_g_idx) > expected_v_size:
-                    v_g_idx = v_g_idx[:expected_v_size]
-                else:
-                    repeats = expected_v_size // len(v_g_idx)
-                    v_g_idx = v_g_idx.repeat(repeats)
-            
-            v_g_idx_reshaped = v_g_idx.reshape([nkvh, dh])
-            v_g_idx_reshaped = v_g_idx_reshaped.reshape([nkvh, 2, dh // 2])
-            v_g_idx_reshaped = v_g_idx_reshaped.transpose(1, 2)
-            v_g_idx = v_g_idx_reshaped.reshape(-1)
-
-            result = []
-            nh_per_dev = nh // ndev
-            nkvh_per_dev = nkvh // ndev
-            
-            for idev in range(ndev):
-                # Q切片
-                q_start = idev * nh_per_dev * dh
-                q_end = (idev + 1) * nh_per_dev * dh
-                result.append(q_g_idx[q_start:q_end])
-
-                # K切片
-                k_start = idev * nkvh_per_dev * dh
-                k_end = (idev + 1) * nkvh_per_dev * dh
-                result.append(k_g_idx[k_start:k_end])
-
-                # V切片
-                v_start = idev * nkvh_per_dev * dh
-                v_end = (idev + 1) * nkvh_per_dev * dh
-                result.append(v_g_idx[v_start:v_end])
-            
-            return result
-
-        # def qkv_scales_slices(_i):
-        #     """Helper function to get QKV scales slices for each device"""
-        #     q_scales = state_dict[naming.attn_q_scales(_i)]
-        #     k_scales = state_dict[naming.attn_k_scales(_i)]
-        #     v_scales = state_dict[naming.attn_v_scales(_i)]
-        #     print(f"  q_scales: shape={q_scales.shape}, dtype={q_scales.dtype}")
-        #     print(f"  k_scales: shape={k_scales.shape}, dtype={k_scales.dtype}")
-        #     print(f"  v_scales: shape={v_scales.shape}, dtype={v_scales.dtype}")
-
-        #     # Reshape scales to match the RoPE-friendly layout of qweight's OutFeatures dimension
-        #     # Original scales shape: [OutFeatures, num_groups] -> [num_heads * head_dim, num_groups]
-        #     # We need to reshape the first dimension to [num_heads, head_dim]
-        #     # Then perform the same transformations as qweight
-
-        #     # Reshape Q scales: [nh * dh, ng] -> [nh, dh, ng]
-        #     q_scales = q_scales.reshape([nh, dh, -1])
-        #     # For Q, the qweight was reshaped to [nh, 2, dh//2, d] and then transposed to [nh, dh//2, 2, d]
-        #     # This means the head_dim (dh) was split and rearranged.
-        #     # We must do the SAME rearrangement to the scales' second dimension (dh):
-        #     q_scales = q_scales.reshape([nh, 2, dh // 2, -1]).transpose(1, 2)
-        #     # Final Q scales shape: [nh, dh//2, 2, num_groups]
-
-        #     # Reshape K scales (same as Q): [nkvh * dh, ng] -> [nkvh, dh, ng] -> [nkvh, 2, dh//2, ng] -> transpose -> [nkvh, dh//2, 2, ng]
-        #     k_scales = k_scales.reshape([nkvh, dh, -1])
-        #     k_scales = k_scales.reshape([nkvh, 2, dh // 2, -1]).transpose(1, 2)
-
-        #     # Reshape V scales: [nkvh * dh, ng] -> [nkvh, dh, ng]
-        #     # For V, the qweight was reshaped to [nkvh, dh//2, 2, d]
-        #     # We need to reshape the dh dimension accordingly: [nkvh, dh, ng] -> [nkvh, dh//2, 2, ng]
-        #     v_scales = v_scales.reshape([nkvh, dh, -1])
-        #     v_scales = v_scales.reshape([nkvh, dh // 2, 2, -1])
-
-        #     print(f"  Reshaped Q scales: {q_scales.shape}")
-        #     print(f"  Reshaped K scales: {k_scales.shape}")
-        #     print(f"  Reshaped V scales: {v_scales.shape}")
-
-        #     result = []
-        #     nh_per_dev = nh // ndev
-        #     nkvh_per_dev = nkvh // ndev
-        #     for idev in range(ndev):
-        #         # Slice the scales exactly the same way as the qweight
-        #         result.append(q_scales[idev * nh_per_dev : (idev + 1) * nh_per_dev, :, :, :])
-        #         result.append(k_scales[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :])
-        #         result.append(v_scales[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :])
-        #     return result
-
-        # def qkv_qzeros_slices(_i):
-        #     """Helper function to get QKV qzeros slices for each device"""
-        #     q_qzeros = state_dict[naming.attn_q_qzeros(_i)]
-        #     k_qzeros = state_dict[naming.attn_k_qzeros(_i)]
-        #     v_qzeros = state_dict[naming.attn_v_qzeros(_i)]
-        #     print(f"  q_qzeros: shape={q_qzeros.shape}, dtype={q_qzeros.dtype}")
-        #     print(f"  k_qzeros: shape={k_qzeros.shape}, dtype={k_qzeros.dtype}")
-        #     print(f"  v_qzeros: shape={v_qzeros.shape}, dtype={v_qzeros.dtype}")
-
-        #     # UNPACK qzeros (same as qweight)! They are also packed as int32.
-        #     def unpack_int32_to_int8(tensor):
-        #         unpacked = tensor.view(torch.uint8).reshape(*tensor.shape, 4)
-        #         return unpacked.to(torch.int8) - 128
-
-        #     # Unpack and reshape Q zeros
-        #     q_qzeros = unpack_int32_to_int8(q_qzeros) # Shape becomes [OutFeat, num_groups, 4]
-        #     # We need to apply the same RoPE transformation to the first dimension
-        #     q_qzeros = q_qzeros.reshape([nh, dh, -1, 4]) # [nh, dh, num_groups, 4]
-        #     q_qzeros = q_qzeros.reshape([nh, 2, dh//2, -1, 4]).transpose(1, 2) # [nh, dh//2, 2, num_groups, 4]
-
-        #     # Unpack and reshape K zeros
-        #     k_qzeros = unpack_int32_to_int8(k_qzeros)
-        #     k_qzeros = k_qzeros.reshape([nkvh, dh, -1, 4])
-        #     k_qzeros = k_qzeros.reshape([nkvh, 2, dh//2, -1, 4]).transpose(1, 2)
-
-        #     # Unpack and reshape V zeros
-        #     v_qzeros = unpack_int32_to_int8(v_qzeros)
-        #     v_qzeros = v_qzeros.reshape([nkvh, dh, -1, 4])
-        #     v_qzeros = v_qzeros.reshape([nkvh, dh//2, 2, -1, 4])
-
-        #     print(f"  Reshaped Q qzeros: {q_qzeros.shape}")
-        #     print(f"  Reshaped K qzeros: {k_qzeros.shape}")
-        #     print(f"  Reshaped V qzeros: {v_qzeros.shape}")
-
-        #     result = []
-        #     nh_per_dev = nh // ndev
-        #     nkvh_per_dev = nkvh // ndev
-        #     for idev in range(ndev):
-        #         result.append(q_qzeros[idev * nh_per_dev : (idev + 1) * nh_per_dev, :, :, :, :])
-        #         result.append(k_qzeros[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :, :])
-        #         result.append(v_qzeros[idev * nkvh_per_dev : (idev + 1) * nkvh_per_dev, :, :, :, :])
-        #     return result
-
-        # def qkv_g_idx_slices(_i):
-        #     """Helper function to get QKV g_idx slices for each device"""
-        #     q_g_idx = state_dict[naming.attn_q_g_idx(_i)]
-        #     k_g_idx = state_dict[naming.attn_k_g_idx(_i)]
-        #     v_g_idx = state_dict[naming.attn_v_g_idx(_i)]
-        #     print(f"  q_g_idx: shape={q_g_idx.shape}, dtype={q_g_idx.dtype}")
-        #     print(f"  k_g_idx: shape={k_g_idx.shape}, dtype={k_g_idx.dtype}")
-        #     print(f"  v_g_idx: shape={v_g_idx.shape}, dtype={v_g_idx.dtype}")
-
-        #     # g_idx is only based on InFeatures (d_model), which remains unchanged.
-        #     # We simply broadcast the same g_idx to all devices.
-        #     result = []
-        #     for idev in range(ndev):
-        #         # Each device gets a full copy of the original g_idx tensor
-        #         result.append(q_g_idx) # For Q linear
-        #         result.append(k_g_idx) # For K linear
-        #         result.append(v_g_idx) # For V linear
-        #     return result
-
-        def gate_up_qweight_slices(_i):
-            """Helper function to get Gate/Up qweight slices for each device"""
-            gate_qweight = state_dict[naming.gate_qweight(_i)]
-            up_qweight = state_dict[naming.up_qweight(_i)]
-            
-            result = []
-            di_per_dev = di // ndev
-            for idev in range(ndev):
-                result.append(gate_qweight[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-                result.append(up_qweight[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-            return result
-
-        def gate_up_scales_slices(_i):
-            """Helper function to get Gate/Up scales slices for each device"""
-            gate_scales = state_dict[naming.gate_scales(_i)]
-            up_scales = state_dict[naming.up_scales(_i)]
-            
-            result = []
-            di_per_dev = di // ndev
-            for idev in range(ndev):
-                result.append(gate_scales[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-                result.append(up_scales[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-            return result
-
-        def gate_up_qzeros_slices(_i):
-            """Helper function to get Gate/Up qzeros slices for each device"""
-            gate_qzeros = state_dict[naming.gate_qzeros(_i)]
-            up_qzeros = state_dict[naming.up_qzeros(_i)]
-            
-            result = []
-            di_per_dev = di // ndev
-            for idev in range(ndev):
-                result.append(gate_qzeros[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-                result.append(up_qzeros[idev * di_per_dev : (idev + 1) * di_per_dev, :])
-            return result
-
-        def gate_up_g_idx_slices(_i):
-            """Helper function to get Gate/Up g_idx slices for each device"""
-            gate_g_idx = state_dict[naming.gate_g_idx(_i)]
-            up_g_idx = state_dict[naming.up_g_idx(_i)]
-            
-            result = []
-            di_per_dev = di // ndev
-            for idev in range(ndev):
-                result.append(gate_g_idx[idev * di_per_dev : (idev + 1) * di_per_dev])
-                result.append(up_g_idx[idev * di_per_dev : (idev + 1) * di_per_dev])
-            return result
-
+        print(f"qkv qw input shapes - Q qw:{state_dict[naming.attn_q_qweight(0)].shape}, K qw:{state_dict[naming.attn_k_qweight(0)].shape}, V qw:{state_dict[naming.attn_v_qweight(0)].shape}")
+        print(f"qkv bias input shapes - Qb:{state_dict[naming.attn_q_b(0)].shape}, Kb:{state_dict[naming.attn_k_b(0)].shape}, Vb:{state_dict[naming.attn_v_b(0)].shape}")
+        print(f"down input shapes - o qw:{state_dict[naming.attn_o_qweight(0)].shape}")
+        print(f"gate up input shapes - gate qw:{state_dict[naming.gate_qweight(0)].shape}, up qw:{state_dict[naming.up_qweight(0)].shape}")
+        print(f"down input shapes - down qw:{state_dict[naming.down_qweight(0)].shape}")
+        
         # Process each layer
         for i in range(nlayer):
-            # Process QKV weights
-            qkv_qweight_slices_i = qkv_qweight_slices(i)
-            qkv_scales_slices_i = qkv_scales_slices(i)
-            qkv_qzeros_slices_i = qkv_qzeros_slices(i)
-            qkv_g_idx_slices_i = qkv_g_idx_slices(i)
             
-            # Concatenate and store
-            attn_qkv_qweights.append(torch.cat(qkv_qweight_slices_i).contiguous())
-            attn_qkv_scales_list.append(torch.cat(qkv_scales_slices_i).contiguous())
-            attn_qkv_qzeros_list.append(torch.cat(qkv_qzeros_slices_i).contiguous())
-            attn_qkv_g_idx_list.append(torch.cat(qkv_g_idx_slices_i).contiguous())
+            # Dequantize Q weights
+            q_dequantized = self._dequantize_weight(
+                state_dict[naming.attn_q_qweight(i)],
+                state_dict[naming.attn_q_scales(i)],
+                state_dict[naming.attn_q_qzeros(i)],
+                state_dict[naming.attn_q_g_idx(i)]
+            )
+            self.attn_q_tensors.append(q_dequantized)
             
-            # Process attention output weights
-            attn_o_qweights.append(state_dict[naming.attn_o_qweight(i)].contiguous())
-            attn_o_scales_list.append(state_dict[naming.attn_o_scales(i)].contiguous())
-            attn_o_qzeros_list.append(state_dict[naming.attn_o_qzeros(i)].contiguous())
-            attn_o_g_idx_list.append(state_dict[naming.attn_o_g_idx(i)].contiguous())
+            # Dequantize K weights
+            k_dequantized = self._dequantize_weight(
+                state_dict[naming.attn_k_qweight(i)],
+                state_dict[naming.attn_k_scales(i)],
+                state_dict[naming.attn_k_qzeros(i)],
+                state_dict[naming.attn_k_g_idx(i)]
+            )
+            self.attn_k_tensors.append(k_dequantized)
             
-            # Process gate/up weights
-            gate_up_qweight_slices_i = gate_up_qweight_slices(i)
-            gate_up_scales_slices_i = gate_up_scales_slices(i)
-            gate_up_qzeros_slices_i = gate_up_qzeros_slices(i)
-            gate_up_g_idx_slices_i = gate_up_g_idx_slices(i)
+            # Dequantize V weights
+            v_dequantized = self._dequantize_weight(
+                state_dict[naming.attn_v_qweight(i)],
+                state_dict[naming.attn_v_scales(i)],
+                state_dict[naming.attn_v_qzeros(i)],
+                state_dict[naming.attn_v_g_idx(i)]
+            )
+            self.attn_v_tensors.append(v_dequantized)
             
-            ffn_gate_up_qweights.append(torch.cat(gate_up_qweight_slices_i).contiguous())
-            ffn_gate_up_scales_list.append(torch.cat(gate_up_scales_slices_i).contiguous())
-            ffn_gate_up_qzeros_list.append(torch.cat(gate_up_qzeros_slices_i).contiguous())
-            ffn_gate_up_g_idx_list.append(torch.cat(gate_up_g_idx_slices_i).contiguous())
+            # Dequantize O weights
+            o_dequantized = self._dequantize_weight(
+                state_dict[naming.attn_o_qweight(i)],
+                state_dict[naming.attn_o_scales(i)],
+                state_dict[naming.attn_o_qzeros(i)],
+                state_dict[naming.attn_o_g_idx(i)]
+            )
+            self.attn_o_tensors.append(o_dequantized)
             
-            # Process down weights
-            ffn_down_qweights.append(state_dict[naming.down_qweight(i)].contiguous())
-            ffn_down_scales_list.append(state_dict[naming.down_scales(i)].contiguous())
-            ffn_down_qzeros_list.append(state_dict[naming.down_qzeros(i)].contiguous())
-            ffn_down_g_idx_list.append(state_dict[naming.down_g_idx(i)].contiguous())
-
-        # Assign pointers to the C struct
+            # Dequantize Gate weights
+            gate_dequantized = self._dequantize_weight(
+                state_dict[naming.gate_qweight(i)],
+                state_dict[naming.gate_scales(i)],
+                state_dict[naming.gate_qzeros(i)],
+                state_dict[naming.gate_g_idx(i)]
+            )
+            if not transpose_weight:
+                gate_dequantized = gate_dequantized.transpose(0, 1).contiguous()
+            self.gate_tensors.append(gate_dequantized)
+            
+            # Dequantize Up weights
+            up_dequantized = self._dequantize_weight(
+                state_dict[naming.up_qweight(i)],
+                state_dict[naming.up_scales(i)],
+                state_dict[naming.up_qzeros(i)],
+                state_dict[naming.up_g_idx(i)]
+            )
+            if not transpose_weight:
+                up_dequantized = up_dequantized.transpose(0, 1).contiguous()
+            self.up_tensors.append(up_dequantized)
+            
+            # Dequantize Down weights
+            down_dequantized = self._dequantize_weight(
+                state_dict[naming.down_qweight(i)],
+                state_dict[naming.down_scales(i)],
+                state_dict[naming.down_qzeros(i)],
+                state_dict[naming.down_g_idx(i)]
+            )
+            self.down_tensors.append(down_dequantized)
+            
+            # Handle bias terms if they exist
+            if self.has_bias:
+                self.attn_q_b_tensors.append(state_dict[naming.attn_q_b(i)])
+                self.attn_k_b_tensors.append(state_dict[naming.attn_k_b(i)])
+                self.attn_v_b_tensors.append(state_dict[naming.attn_v_b(i)])
+        
+        # Now create a fake state_dict with dequantized weights
+        fake_state_dict = {}
+        
+        # Add input embedding and output norm (these are not quantized)
+        fake_state_dict[naming.input_embd()] = self.input_embd_tensor
+        fake_state_dict[naming.output_norm()] = self.output_norm_tensor
+        fake_state_dict[naming.output_embd()] = self.output_embd_tensor
+        
+        # Add layer weights
         for i in range(nlayer):
-            self.attn_qkv_qweight[i] = attn_qkv_qweights[i].data_ptr()
-            self.attn_qkv_scales[i] = attn_qkv_scales_list[i].data_ptr()
-            self.attn_qkv_qzeros[i] = attn_qkv_qzeros_list[i].data_ptr()
-            self.attn_qkv_g_idx[i] = attn_qkv_g_idx_list[i].data_ptr()
+            fake_state_dict[naming.attn_norm(i)] = self.attn_norm_tensors[i]
+            fake_state_dict[naming.attn_q(i)] = self.attn_q_tensors[i]
+            fake_state_dict[naming.attn_k(i)] = self.attn_k_tensors[i]
+            fake_state_dict[naming.attn_v(i)] = self.attn_v_tensors[i]
+            fake_state_dict[naming.attn_o(i)] = self.attn_o_tensors[i]
+            fake_state_dict[naming.ffn_norm(i)] = self.ffn_norm_tensors[i]
+            fake_state_dict[naming.gate(i)] = self.gate_tensors[i]
+            fake_state_dict[naming.up(i)] = self.up_tensors[i]
+            fake_state_dict[naming.down(i)] = self.down_tensors[i]
             
-            self.attn_o_qweight[i] = attn_o_qweights[i].data_ptr()
-            self.attn_o_scales[i] = attn_o_scales_list[i].data_ptr()
-            self.attn_o_qzeros[i] = attn_o_qzeros_list[i].data_ptr()
-            self.attn_o_g_idx[i] = attn_o_g_idx_list[i].data_ptr()
+            # Add bias terms if they exist
+            if self.has_bias:
+                fake_state_dict[naming.attn_q_b(i)] = self.attn_q_b_tensors[i]
+                fake_state_dict[naming.attn_k_b(i)] = self.attn_k_b_tensors[i]
+                fake_state_dict[naming.attn_v_b(i)] = self.attn_v_b_tensors[i]
+        
+        # Now call the full precision initialization with the dequantized weights
+        self._init_full_precision_weights(
+            naming,
+            fake_state_dict,
+            nlayer,
+            ndev,
+            nh,
+            nkvh,
+            dh,
+            d,
+            di,
+            self.input_embd_tensor.dtype,  # Use the same dtype as input embedding
+            self.input_embd_tensor.dtype,
+            transpose_weight,
+            scale_o,
+            scale_down,
+        )
+
+    def _dequantize_weight(self, qweight, scales, qzeros, g_idx):
+        """
+        Dequantize GPTQ int8 weights to full precision
+        
+        Args:
+            qweight: torch.Tensor - int8 quantized weights (packed format)
+            scales: torch.Tensor - float16 scale factors
+            qzeros: torch.Tensor - int8 zero points (packed format)
+            g_idx: torch.Tensor - group indices mapping weights to scales/zeros
+        
+        Returns:
+            torch.Tensor: Dequantized weights in float16
+        """
+        # Unpack qweight (int8 weights packed into int32)
+        # Each int32 contains 4 int8 weights
+        qweight_unpacked = torch.zeros(
+            (qweight.shape[0], qweight.shape[1] * 4),
+            dtype=torch.int8,
+            device=qweight.device
+        )
+        
+        # Unpack each int32 into 4 int8 values
+        for i in range(4):
+            qweight_unpacked[:, i::4] = (qweight >> (8 * i)) & 0xFF
+        
+        # Unpack qzeros similarly
+        qzeros_unpacked = torch.zeros(
+            (qzeros.shape[0], qzeros.shape[1] * 4),
+            dtype=torch.int8,
+            device=qzeros.device
+        )
+        for i in range(4):
+            qzeros_unpacked[:, i::4] = (qzeros >> (8 * i)) & 0xFF
+        
+        # Get original weight dimensions
+        out_features, in_features = qweight_unpacked.shape
+        
+        # Reshape scales and zeros to match weight groups
+        scales = scales.reshape(-1, 1)
+        qzeros_unpacked = qzeros_unpacked.reshape(-1, 1)
+        
+        # Calculate the number of groups
+        group_size = self.group_size
+        num_groups = (in_features + group_size - 1) // group_size
+        
+        # Ensure scales and zeros have the correct shape
+        if scales.shape[0] < num_groups:
+            scales = scales.repeat(num_groups // scales.shape[0] + 1, 1)
+            scales = scales[:num_groups]
+        
+        if qzeros_unpacked.shape[0] < num_groups:
+            qzeros_unpacked = qzeros_unpacked.repeat(num_groups // qzeros_unpacked.shape[0] + 1, 1)
+            qzeros_unpacked = qzeros_unpacked[:num_groups]
+        
+        # Expand scales and zeros to match the weight dimensions
+        scales_expanded = torch.zeros((out_features, in_features), 
+                                    dtype=scales.dtype, 
+                                    device=scales.device)
+        zeros_expanded = torch.zeros((out_features, in_features), 
+                                dtype=qzeros_unpacked.dtype, 
+                                device=qzeros_unpacked.device)
+        
+        # Apply group-wise scaling
+        for g in range(num_groups):
+            start_idx = g * group_size
+            end_idx = min((g + 1) * group_size, in_features)
             
-            self.ffn_gate_up_qweight[i] = ffn_gate_up_qweights[i].data_ptr()
-            self.ffn_gate_up_scales[i] = ffn_gate_up_scales_list[i].data_ptr()
-            self.ffn_gate_up_qzeros[i] = ffn_gate_up_qzeros_list[i].data_ptr()
-            self.ffn_gate_up_g_idx[i] = ffn_gate_up_g_idx_list[i].data_ptr()
-            
-            self.ffn_down_qweight[i] = ffn_down_qweights[i].data_ptr()
-            self.ffn_down_scales[i] = ffn_down_scales_list[i].data_ptr()
-            self.ffn_down_qzeros[i] = ffn_down_qzeros_list[i].data_ptr()
-            self.ffn_down_g_idx[i] = ffn_down_g_idx_list[i].data_ptr()
+            if start_idx >= in_features:
+                break
+                
+            scales_expanded[:, start_idx:end_idx] = scales[g]
+            zeros_expanded[:, start_idx:end_idx] = qzeros_unpacked[g]
+        
+        # Dequantize weights using: (qweight - zero) * scale
+        if self.symmetric:
+            dequantized_weight = qweight_unpacked.float() * scales_expanded.float()
+        else:
+            dequantized_weight = (qweight_unpacked.float() - zeros_expanded.float()) * scales_expanded.float()
+        
+        # Convert back to float16
+        dequantized_weight = dequantized_weight.half()
+        
+        return dequantized_weight.contiguous()
 
     def _init_full_precision_weights(
         self,
@@ -819,10 +644,12 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
     ):
         """Initialize full-precision weights"""
         print(f"nh: {nh}, nkvh: {nkvh}, dh: {dh}, d: {d}")
+        print(f"qkv input shapes - Q:{state_dict[naming.attn_q(0)].shape}, K:{state_dict[naming.attn_k(0)].shape}, V:{state_dict[naming.attn_v(0)].shape}")
+        print(f"qkv bias input shapes - Qb:{state_dict[naming.attn_q_b(0)].shape}, Kb:{state_dict[naming.attn_k_b(0)].shape}, Vb:{state_dict[naming.attn_v_b(0)].shape}")
+        print(f"down input shapes - o:{state_dict[naming.attn_o(0)].shape}")
+        print(f"gate up input shapes - gate:{state_dict[naming.gate(0)].shape}, up:{state_dict[naming.up(0)].shape}")
+        print(f"down input shapes - down:{state_dict[naming.down(0)].shape}")
         def qkv_slices(_i):
-            print(f"  Q state_dict[naming.attn_q(_i)]: shape={state_dict[naming.attn_q(_i)].shape}, dtype={state_dict[naming.attn_q(_i)].dtype}")
-            print(f"  K state_dict[naming.attn_k(_i)]: shape={state_dict[naming.attn_k(_i)].shape}, dtype={state_dict[naming.attn_k(_i)].dtype}")
-            print(f"  V state_dict[naming.attn_v(_i)]: shape={state_dict[naming.attn_v(_i)].shape}, dtype={state_dict[naming.attn_v(_i)].dtype}")
             _Q = (
                 state_dict[naming.attn_q(_i)]
                 .reshape([nh, 2, dh // 2, d])
@@ -882,6 +709,7 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             self.qkv_b_tensors = [
                 torch.concat(qkv_b_slices(i)).to(torch_dt_logits) for i in range(nlayer)
             ]
+            # print(f"qkv_b_tensors shapes: {[t.shape for t in self.qkv_b_tensors]}")
             self.qkv_b_tensor_ptrs = [
                 self.qkv_b_tensors[i].data_ptr() for i in range(nlayer)
             ]
