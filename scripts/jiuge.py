@@ -329,10 +329,17 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         ]
         self.attn_norm = (c_void_p * nlayer)(*self.attn_norm_ptrs)
 
+        self.ffn_norm_tensors = [
+            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
+        ]
+        self.ffn_norm_ptrs = [
+            self.ffn_norm_tensors[i].data_ptr() for i in range(nlayer)
+        ]
+        self.ffn_norm = (c_void_p * nlayer)(*self.ffn_norm_ptrs)
+
         # Initialize quantized weights if needed
         if is_quantized and isinstance(naming, GPTQWeightsNaming):
             if self.bits == 8:
-                # self._init_quantized_weights_i8(
                 self._init_quantized_weights_i8_naive(
                     naming,
                     state_dict,
@@ -365,15 +372,6 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
                 scale_down,
             )
 
-        # Common initialization for both quantized and full-precision
-        self.ffn_norm_tensors = [
-            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-        ]
-        self.ffn_norm_ptrs = [
-            self.ffn_norm_tensors[i].data_ptr() for i in range(nlayer)
-        ]
-        self.ffn_norm = (c_void_p * nlayer)(*self.ffn_norm_ptrs)
-    
     def _init_quantized_weights_i8_naive(
         self,
         naming,
@@ -390,6 +388,8 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         scale_down,
     ):
         """Initialize quantized weights by dequantizing them to full precision"""
+        print("Dequantizing GPTQ weights to full precision...")
+
         # Initialize all tensors as empty lists
         self.attn_q_tensors = []
         self.attn_k_tensors = []
@@ -398,113 +398,98 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         self.gate_tensors = []
         self.up_tensors = []
         self.down_tensors = []
-        
-        # Check if bias terms exist and initialize them if they do
+
+        # Check if bias terms exist
         self.has_bias = naming.attn_q_b(0) in state_dict
         if self.has_bias:
             self.attn_q_b_tensors = []
             self.attn_k_b_tensors = []
             self.attn_v_b_tensors = []
-        
-        # First, make sure all norm tensors are initialized
-        torch_dt_norm = self.output_norm_tensor.dtype
-        self.attn_norm_tensors = [
-            state_dict[naming.attn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-        ]
-        self.ffn_norm_tensors = [
-            state_dict[naming.ffn_norm(i)].to(torch_dt_norm) for i in range(nlayer)
-        ]
-        print(f"nh: {nh}, nkvh: {nkvh}, dh: {dh}, d: {d}")
-        print(f"qkv qw input shapes - Q qw:{state_dict[naming.attn_q_qweight(0)].shape}, K qw:{state_dict[naming.attn_k_qweight(0)].shape}, V qw:{state_dict[naming.attn_v_qweight(0)].shape}")
-        print(f"qkv bias input shapes - Qb:{state_dict[naming.attn_q_b(0)].shape}, Kb:{state_dict[naming.attn_k_b(0)].shape}, Vb:{state_dict[naming.attn_v_b(0)].shape}")
-        print(f"down input shapes - o qw:{state_dict[naming.attn_o_qweight(0)].shape}")
-        print(f"gate up input shapes - gate qw:{state_dict[naming.gate_qweight(0)].shape}, up qw:{state_dict[naming.up_qweight(0)].shape}")
-        print(f"down input shapes - down qw:{state_dict[naming.down_qweight(0)].shape}")
-        
+
         # Process each layer
         for i in range(nlayer):
-            
-            # Dequantize Q weights
-            q_dequantized = self._dequantize_weight(
+            if i % 10 == 0:
+                print(f"Dequantizing layer {i}/{nlayer}")
+
+            # Dequantize weights
+            q_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.attn_q_qweight(i)],
                 state_dict[naming.attn_q_scales(i)],
                 state_dict[naming.attn_q_qzeros(i)],
-                state_dict[naming.attn_q_g_idx(i)]
+                state_dict[naming.attn_q_g_idx(i)],
             )
             self.attn_q_tensors.append(q_dequantized)
-            
-            # Dequantize K weights
-            k_dequantized = self._dequantize_weight(
+
+            k_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.attn_k_qweight(i)],
                 state_dict[naming.attn_k_scales(i)],
                 state_dict[naming.attn_k_qzeros(i)],
-                state_dict[naming.attn_k_g_idx(i)]
+                state_dict[naming.attn_k_g_idx(i)],
             )
             self.attn_k_tensors.append(k_dequantized)
-            
-            # Dequantize V weights
-            v_dequantized = self._dequantize_weight(
+
+            v_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.attn_v_qweight(i)],
                 state_dict[naming.attn_v_scales(i)],
                 state_dict[naming.attn_v_qzeros(i)],
-                state_dict[naming.attn_v_g_idx(i)]
+                state_dict[naming.attn_v_g_idx(i)],
             )
             self.attn_v_tensors.append(v_dequantized)
-            
-            # Dequantize O weights
-            o_dequantized = self._dequantize_weight(
+
+            o_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.attn_o_qweight(i)],
                 state_dict[naming.attn_o_scales(i)],
                 state_dict[naming.attn_o_qzeros(i)],
-                state_dict[naming.attn_o_g_idx(i)]
+                state_dict[naming.attn_o_g_idx(i)],
             )
             self.attn_o_tensors.append(o_dequantized)
-            
-            # Dequantize Gate weights
-            gate_dequantized = self._dequantize_weight(
+
+            gate_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.gate_qweight(i)],
                 state_dict[naming.gate_scales(i)],
                 state_dict[naming.gate_qzeros(i)],
-                state_dict[naming.gate_g_idx(i)]
-            )
-            if not transpose_weight:
-                gate_dequantized = gate_dequantized.transpose(0, 1).contiguous()
+                state_dict[naming.gate_g_idx(i)],
+            ).reshape([-1, d])
             self.gate_tensors.append(gate_dequantized)
-            
-            # Dequantize Up weights
-            up_dequantized = self._dequantize_weight(
+
+            up_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.up_qweight(i)],
                 state_dict[naming.up_scales(i)],
                 state_dict[naming.up_qzeros(i)],
-                state_dict[naming.up_g_idx(i)]
-            )
-            if not transpose_weight:
-                up_dequantized = up_dequantized.transpose(0, 1).contiguous()
+                state_dict[naming.up_g_idx(i)],
+            ).reshape([-1, d])
             self.up_tensors.append(up_dequantized)
-            
-            # Dequantize Down weights
-            down_dequantized = self._dequantize_weight(
+
+            down_dequantized = self._dequantize_weight_i8(
                 state_dict[naming.down_qweight(i)],
                 state_dict[naming.down_scales(i)],
                 state_dict[naming.down_qzeros(i)],
-                state_dict[naming.down_g_idx(i)]
+                state_dict[naming.down_g_idx(i)],
             )
             self.down_tensors.append(down_dequantized)
-            
+
             # Handle bias terms if they exist
             if self.has_bias:
-                self.attn_q_b_tensors.append(state_dict[naming.attn_q_b(i)])
-                self.attn_k_b_tensors.append(state_dict[naming.attn_k_b(i)])
-                self.attn_v_b_tensors.append(state_dict[naming.attn_v_b(i)])
-        
-        # Now create a fake state_dict with dequantized weights
+                self.attn_q_b_tensors.append(
+                    state_dict[naming.attn_q_b(i)].to(self.input_embd_tensor.dtype)
+                )
+                self.attn_k_b_tensors.append(
+                    state_dict[naming.attn_k_b(i)].to(self.input_embd_tensor.dtype)
+                )
+                self.attn_v_b_tensors.append(
+                    state_dict[naming.attn_v_b(i)].to(self.input_embd_tensor.dtype)
+                )
+
+        print("Dequantization completed. Creating fake state dict...")
+
+        # Create a fake state_dict with dequantized weights
         fake_state_dict = {}
-        
-        # Add input embedding and output norm (these are not quantized)
+
+        # Add non-quantized weights
         fake_state_dict[naming.input_embd()] = self.input_embd_tensor
         fake_state_dict[naming.output_norm()] = self.output_norm_tensor
         fake_state_dict[naming.output_embd()] = self.output_embd_tensor
-        
+
         # Add layer weights
         for i in range(nlayer):
             fake_state_dict[naming.attn_norm(i)] = self.attn_norm_tensors[i]
@@ -516,14 +501,15 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             fake_state_dict[naming.gate(i)] = self.gate_tensors[i]
             fake_state_dict[naming.up(i)] = self.up_tensors[i]
             fake_state_dict[naming.down(i)] = self.down_tensors[i]
-            
-            # Add bias terms if they exist
+
             if self.has_bias:
                 fake_state_dict[naming.attn_q_b(i)] = self.attn_q_b_tensors[i]
                 fake_state_dict[naming.attn_k_b(i)] = self.attn_k_b_tensors[i]
                 fake_state_dict[naming.attn_v_b(i)] = self.attn_v_b_tensors[i]
-        
-        # Now call the full precision initialization with the dequantized weights
+
+        print("Calling full precision initialization with dequantized weights...")
+
+        # Now call the full precision initialization
         self._init_full_precision_weights(
             naming,
             fake_state_dict,
@@ -534,95 +520,108 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
             dh,
             d,
             di,
-            self.input_embd_tensor.dtype,  # Use the same dtype as input embedding
+            self.input_embd_tensor.dtype,
             self.input_embd_tensor.dtype,
             transpose_weight,
             scale_o,
             scale_down,
         )
 
-    def _dequantize_weight(self, qweight, scales, qzeros, g_idx):
+    def _dequantize_weight_i8(self, qweight, scales, qzeros, g_idx):
         """
-        Dequantize GPTQ int8 weights to full precision
-        
-        Args:
-            qweight: torch.Tensor - int8 quantized weights (packed format)
-            scales: torch.Tensor - float16 scale factors
-            qzeros: torch.Tensor - int8 zero points (packed format)
-            g_idx: torch.Tensor - group indices mapping weights to scales/zeros
-        
-        Returns:
-            torch.Tensor: Dequantized weights in float16
+        Correctly dequantize GPTQ int8 weights to full precision
         """
-        # Unpack qweight (int8 weights packed into int32)
-        # Each int32 contains 4 int8 weights
+        qweight = qweight.permute(0, 1)
+        scales = scales.permute(0, 1)
+        qzeros = qzeros.permute(0, 1)
+
+        # Get original dimensions
+        out_features, in_features_packed = qweight.shape
+        in_features = in_features_packed * 4  # Each int32 contains 4 int8 values
+
+        # Convert to appropriate device and dtype
+        device = qweight.device
+
+        # Unpack qweight - each int32 contains 4 int8 values
         qweight_unpacked = torch.zeros(
-            (qweight.shape[0], qweight.shape[1] * 4),
-            dtype=torch.int8,
-            device=qweight.device
+            (out_features, in_features), dtype=torch.int8, device=device
         )
-        
-        # Unpack each int32 into 4 int8 values
+
+        # Proper unpacking of int32 to 4 int8 values
         for i in range(4):
-            qweight_unpacked[:, i::4] = (qweight >> (8 * i)) & 0xFF
-        
-        # Unpack qzeros similarly
-        qzeros_unpacked = torch.zeros(
-            (qzeros.shape[0], qzeros.shape[1] * 4),
-            dtype=torch.int8,
-            device=qzeros.device
-        )
-        for i in range(4):
-            qzeros_unpacked[:, i::4] = (qzeros >> (8 * i)) & 0xFF
-        
-        # Get original weight dimensions
-        out_features, in_features = qweight_unpacked.shape
-        
-        # Reshape scales and zeros to match weight groups
-        scales = scales.reshape(-1, 1)
-        qzeros_unpacked = qzeros_unpacked.reshape(-1, 1)
-        
-        # Calculate the number of groups
-        group_size = self.group_size
-        num_groups = (in_features + group_size - 1) // group_size
-        
-        # Ensure scales and zeros have the correct shape
-        if scales.shape[0] < num_groups:
-            scales = scales.repeat(num_groups // scales.shape[0] + 1, 1)
-            scales = scales[:num_groups]
-        
-        if qzeros_unpacked.shape[0] < num_groups:
-            qzeros_unpacked = qzeros_unpacked.repeat(num_groups // qzeros_unpacked.shape[0] + 1, 1)
-            qzeros_unpacked = qzeros_unpacked[:num_groups]
-        
-        # Expand scales and zeros to match the weight dimensions
-        scales_expanded = torch.zeros((out_features, in_features), 
-                                    dtype=scales.dtype, 
-                                    device=scales.device)
-        zeros_expanded = torch.zeros((out_features, in_features), 
-                                dtype=qzeros_unpacked.dtype, 
-                                device=qzeros_unpacked.device)
-        
-        # Apply group-wise scaling
-        for g in range(num_groups):
-            start_idx = g * group_size
-            end_idx = min((g + 1) * group_size, in_features)
-            
-            if start_idx >= in_features:
-                break
-                
-            scales_expanded[:, start_idx:end_idx] = scales[g]
-            zeros_expanded[:, start_idx:end_idx] = qzeros_unpacked[g]
-        
-        # Dequantize weights using: (qweight - zero) * scale
-        if self.symmetric:
-            dequantized_weight = qweight_unpacked.float() * scales_expanded.float()
+            shift = i * 8
+            byte_vals = ((qweight >> shift) & 0xFF).to(torch.int8)
+            # Convert to signed int8
+            byte_vals = torch.where(byte_vals > 127, byte_vals - 256, byte_vals)
+            qweight_unpacked[:, i::4] = byte_vals
+
+        # Handle scales and zeros
+        if scales.dim() == 2:
+            # scales: [num_groups, group_size]
+            num_groups, group_size = scales.shape
+            scales = scales.float()
         else:
-            dequantized_weight = (qweight_unpacked.float() - zeros_expanded.float()) * scales_expanded.float()
-        
-        # Convert back to float16
-        dequantized_weight = dequantized_weight.half()
-        
+            # scales: [num_groups]
+            num_groups = scales.shape[0]
+            group_size = in_features // num_groups
+            scales = scales.float().unsqueeze(1).expand(-1, group_size)
+
+        # Unpack qzeros if provided
+        if qzeros is not None:
+            if qzeros.dim() == 2:
+                num_zero_groups, zero_group_size_packed = qzeros.shape
+                zero_group_size = zero_group_size_packed * 4
+                qzeros_unpacked = torch.zeros(
+                    (num_zero_groups, zero_group_size), dtype=torch.int8, device=device
+                )
+
+                for i in range(4):
+                    shift = i * 8
+                    byte_vals = ((qzeros >> shift) & 0xFF).to(torch.int8)
+                    byte_vals = torch.where(byte_vals > 127, byte_vals - 256, byte_vals)
+                    qzeros_unpacked[:, i::4] = byte_vals
+            else:
+                # Handle scalar zeros
+                qzeros_unpacked = torch.zeros_like(
+                    scales, dtype=torch.int8, device=device
+                )
+        else:
+            # Symmetric quantization - zeros are all 0
+            qzeros_unpacked = torch.zeros_like(scales, dtype=torch.int8, device=device)
+
+        # Expand scales and zeros to match weight dimensions
+        scales_expanded = torch.zeros(
+            (out_features, in_features), dtype=torch.float32, device=device
+        )
+        zeros_expanded = torch.zeros(
+            (out_features, in_features), dtype=torch.float32, device=device
+        )
+
+        # Apply group-wise scaling using g_idx
+        for j in range(in_features):
+            group_idx = g_idx[j].item() if j < g_idx.numel() else g_idx[-1].item()
+            scale_val = (
+                scales[group_idx, j % group_size]
+                if scales.dim() == 2
+                else scales[group_idx]
+            )
+
+            if qzeros_unpacked.dim() == 2:
+                zero_val = qzeros_unpacked[
+                    group_idx, j % qzeros_unpacked.shape[1]
+                ].float()
+            else:
+                zero_val = qzeros_unpacked[group_idx].float()
+
+            scales_expanded[:, j] = scale_val
+            zeros_expanded[:, j] = zero_val
+
+        # Dequantize: (quantized - zero_point) * scale
+        dequantized_weight = (
+            qweight_unpacked.float() - zeros_expanded
+        ) * scales_expanded
+        dequantized_weight = dequantized_weight.to(self.input_embd_tensor.dtype)
+
         return dequantized_weight.contiguous()
 
     def _init_full_precision_weights(
@@ -643,12 +642,7 @@ class JiugeWeightsImpl(JiugeWeightsCStruct):
         scale_down,
     ):
         """Initialize full-precision weights"""
-        print(f"nh: {nh}, nkvh: {nkvh}, dh: {dh}, d: {d}")
-        print(f"qkv input shapes - Q:{state_dict[naming.attn_q(0)].shape}, K:{state_dict[naming.attn_k(0)].shape}, V:{state_dict[naming.attn_v(0)].shape}")
-        print(f"qkv bias input shapes - Qb:{state_dict[naming.attn_q_b(0)].shape}, Kb:{state_dict[naming.attn_k_b(0)].shape}, Vb:{state_dict[naming.attn_v_b(0)].shape}")
-        print(f"down input shapes - o:{state_dict[naming.attn_o(0)].shape}")
-        print(f"gate up input shapes - gate:{state_dict[naming.gate(0)].shape}, up:{state_dict[naming.up(0)].shape}")
-        print(f"down input shapes - down:{state_dict[naming.down(0)].shape}")
+
         def qkv_slices(_i):
             _Q = (
                 state_dict[naming.attn_q(_i)]

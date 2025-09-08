@@ -30,7 +30,8 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     std::vector<std::shared_ptr<Tensor>> w_ffn_gate_up_qweight, w_ffn_gate_up_scales, w_ffn_gate_up_qzeros, w_ffn_gate_up_g_idx;
     std::vector<std::shared_ptr<Tensor>> w_ffn_down_qweight, w_ffn_down_scales, w_ffn_down_qzeros, w_ffn_down_g_idx;
 
-    bool is_quantized = weights->is_quantized;
+    // bool is_quantized = weights->is_quantized;
+    bool is_quantized = false;
 
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
         w_attn_norm.push_back(getAttnNorm(meta, weights, layer));
