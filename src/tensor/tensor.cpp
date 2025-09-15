@@ -362,33 +362,141 @@ std::shared_ptr<Tensor> Tensor::view_as(const std::vector<size_t> &new_shape, co
     return tensor;
 }
 
+// Helper function to write tensor data in text format
+template <typename T, typename ShapeType, typename StrideType>
+void write_data_text(std::ostream &os, const T *data,
+                     const std::vector<ShapeType> &shape,
+                     const std::vector<StrideType> &strides,
+                     size_t dim = 0, size_t offset = 0) {
+    if (dim == shape.size() - 1) {
+        // Last dimension - print elements
+        os << "[";
+        for (ShapeType i = 0; i < shape[dim]; ++i) {
+            if (i > 0) {
+                os << ", ";
+            }
+            os << data[offset + i * (strides.empty() ? 1 : strides[dim])];
+        }
+        os << "]";
+    } else {
+        // Higher dimensions - recursive call
+        os << "[";
+        for (ShapeType i = 0; i < shape[dim]; ++i) {
+            if (i > 0) {
+                os << ",\n";
+                // Add indentation for better readability
+                for (size_t j = 0; j <= dim; ++j) {
+                    os << "  ";
+                }
+            }
+            write_data_text(os, data, shape, strides, dim + 1,
+                            offset + i * (strides.empty() ? 1 : strides[dim]));
+        }
+        os << "]";
+    }
+}
+
+// Specialization for bfloat16
+void write_data_text_bf16(std::ostream &os, const uint16_t *data,
+                          const std::vector<size_t> &shape,
+                          const std::vector<int64_t> &strides) {
+    // For bfloat16, you might want special formatting
+    // For now, use the generic version
+    write_data_text(os, data, shape, strides);
+}
+
 void Tensor::debug(const std::string &filename) const {
     RUN_INFINI(infinirtDeviceSynchronize());
 
     std::cout << info() << std::endl;
 
     void const *cpu_data;
+    bool allocated_memory = false;
     if (this->deviceType() != INFINI_DEVICE_CPU) {
         void *cpu_memory = std::malloc(this->_storage->size());
         RUN_INFINI(infinirtMemcpy(cpu_memory, this->_storage->memory(),
                                   this->_storage->size(), INFINIRT_MEMCPY_D2H));
         cpu_data = cpu_memory;
+        allocated_memory = true;
     } else {
         cpu_data = this->_storage->memory();
     }
 
     if (!filename.empty()) {
-        std::ofstream outFile(filename, std::ios::binary);
+        // For better VS Code readability, use text format instead of binary
+        std::ofstream outFile(filename);
         if (!outFile) {
             std::cerr << "Error opening file for writing: " << filename << "\n";
+            if (allocated_memory) {
+                std::free(const_cast<void *>(cpu_data));
+            }
             return;
         }
-        outFile.write(reinterpret_cast<const char *>(cpu_data), this->_storage->size());
+
+        // Write metadata first for context
+        outFile << "Tensor Info: " << info() << "\n";
+        outFile << "Shape: [";
+        for (size_t i = 0; i < this->shape().size(); ++i) {
+            if (i > 0) {
+                outFile << ", ";
+            }
+            outFile << this->shape()[i];
+        }
+        outFile << "]\n";
+        outFile << "Strides: [";
+        for (size_t i = 0; i < this->strides().size(); ++i) {
+            if (i > 0) {
+                outFile << ", ";
+            }
+            outFile << this->strides()[i];
+        }
+        outFile << "]\n";
+        outFile << "Data (offset: " << dataOffset() << "):\n";
+
+        // Write data in human-readable format
+        switch (this->dtype()) {
+        case INFINI_DTYPE_F16:
+            write_data_text(outFile, (uint16_t const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_F32:
+            write_data_text(outFile, (float const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_U64:
+            write_data_text(outFile, (uint64_t const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_I64:
+            write_data_text(outFile, (int64_t const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_U32:
+            write_data_text(outFile, (uint32_t const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_I32:
+            write_data_text(outFile, (int32_t const *)((char const *)cpu_data + dataOffset()),
+                            this->shape(), this->strides());
+            break;
+        case INFINI_DTYPE_BF16:
+            write_data_text_bf16(outFile, (uint16_t const *)((char const *)cpu_data + dataOffset()),
+                                 this->shape(), this->strides());
+            break;
+        default:
+            PANIC("Unsupported data type");
+        }
+
         outFile.close();
-        std::cout << "Data written to file: " << filename << "\n";
+        std::cout << "Data written to file (text format): " << filename << "\n";
+
+        if (allocated_memory) {
+            std::free(const_cast<void *>(cpu_data));
+        }
         return;
     }
 
+    // Original console output remains the same
     switch (this->dtype()) {
     case INFINI_DTYPE_F16:
         print_data((uint16_t const *)((char const *)cpu_data + dataOffset()),
@@ -420,6 +528,10 @@ void Tensor::debug(const std::string &filename) const {
         break;
     default:
         PANIC("Unsupported data type");
+    }
+
+    if (allocated_memory) {
+        std::free(const_cast<void *>(cpu_data));
     }
 }
 
