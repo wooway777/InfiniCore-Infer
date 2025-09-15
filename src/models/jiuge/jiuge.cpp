@@ -195,12 +195,21 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Attention
         // rms norm
+        logits_in->debug("0_rms_norm_in_logits_in.txt");
+        rsrc.w_attn_norm[layer]->debug("0_rms_norm_in_w_attn_norm.txt");
         rmsnorm(logits_out, logits_in, rsrc.w_attn_norm[layer], meta.epsilon);
+        logits_out->debug("0_rms_norm_out_logits_out.txt");
         // qkv_proj
+        rsrc.w_attn_qkv[layer]->debug("1_linear_in_w_attn_qkv.txt");
         linear(qkv_buf, logits_out, rsrc.w_attn_qkv[layer], 1.0, 0.0, nullptr, has_qkv_bias ? rsrc.b_attn_qkv[layer] : nullptr);
+        qkv_buf->debug("1_linear_out_qkv_buf.txt");
         // rope
+        qkv_rope->slice(1, 0, nh)->debug("2_rope_in_qkv_rope.txt");
         rope(qkv_rope->slice(1, 0, nh), qkv_rope->slice(1, 0, nh), pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
+        qkv_rope->slice(1, 0, nh)->debug("2_rope_out_qkv_rope.txt");
+        qkv_rope->slice(1, nh, nkvh)->debug("3_rope_in_qkv_rope.txt");
         rope(qkv_rope->slice(1, nh, nkvh), qkv_rope->slice(1, nh, nkvh), pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
+        qkv_rope->slice(1, nh, nkvh)->debug("3_rope_out_qkv_rope.txt");
 
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
@@ -220,12 +229,20 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
             rearrange(q_rearrange->slice(2, 0, seq_len), q);
             auto qk_gemm = qk_buf->slice(0, 0, nh * seq_len * total_len)->view({nkvh, ngroup * seq_len, total_len});
             auto k_gemm = kv_caches[req]->k[idev][layer]->slice(0, 0, total_len)->permute({1, 2, 0});
+            q_rearrange->slice(2, 0, seq_len)->debug("4_linear_in_q_rearrange.txt");
+            k_gemm->debug("4_linear_in_k_gemm.txt");
             linear(qk_gemm, rearrange_q_buf->slice(1, 0, ngroup * seq_len), k_gemm, 1.f / float(sqrt(dh)), 0.f, nullptr, nullptr);
+            qk_gemm->debug("4_linear_out_qk_gemm.txt");
             // softmax
             auto qk_softmax = qk_gemm->view({nh, seq_len, total_len});
+            qk_softmax->debug("5_causalSoftmax_in_qk_softmax.txt");
             causalSoftmax(qk_softmax, qk_softmax);
+            qk_softmax->debug("5_causalSoftmax_out_qk_softmax.txt");
             auto v_gemm = kv_caches[req]->v[idev][layer]->slice(0, 0, total_len)->permute({1, 0, 2});
+            qk_gemm->debug("6_linear_in_qk_gemm.txt");
+            v_gemm->debug("6_linear_in_v_gemm.txt");
             linear(attn_val_buf->slice(1, 0, ngroup * seq_len), qk_gemm, v_gemm, 1.f, 0.f, nullptr, nullptr);
+            attn_val_buf->slice(1, 0, ngroup * seq_len)->debug("6_linear_out_attn_val_buf.txt");
             // rearrange attn val
             rearrange(o, attn_val_gemm->slice(2, 0, seq_len));
 
@@ -233,7 +250,10 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
         }
 
         // o_proj
+        o_buf->debug("7_linear_in_o_buf.txt");
+        rsrc.w_attn_out[layer]->debug("7_linear_in_w_attn_out.txt");
         linear(logits_in, o_buf, rsrc.w_attn_out[layer], 1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
+        logits_in->debug("7_linear_out_logits_in.txt");
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
@@ -243,10 +263,25 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
         // 2. FFN
+        logits_in->debug("8_rms_norm_in_logits_in.txt");
+        rsrc.w_ffn_norm[layer]->debug("8_rms_norm_in_w_ffn_norm.txt");
         rmsnorm(logits_out, logits_in, rsrc.w_ffn_norm[layer], meta.epsilon);
+        logits_out->debug("8_rms_norm_out_logits_out.txt");
+
+        logits_out->debug("9_linear_in_logits_out.txt");
+        rsrc.w_ffn_gate_up[layer]->debug("9_linear_in_w_ffn_gate_up.txt");
         linear(gate_up_buf, logits_out, rsrc.w_ffn_gate_up[layer], 1.0, 0.0, nullptr, nullptr);
+        gate_up_buf->debug("9_linear_out_gate_up_buf.txt");
+
+        gate_buf->debug("10_swiglu_in_gate_buf.txt");
+        up_buf->debug("10_swiglu_in_up_buf.txt");
         swiglu(gate_buf, up_buf, gate_buf);
+        gate_buf->debug("10_swiglu_out_gate_buf.txt");
+
+        gate_buf->debug("11_linear_in_gate_buf.txt");
+        rsrc.w_ffn_down[layer]->debug("11_linear_in_w_ffn_down.txt");
         linear(logits_in, gate_buf, rsrc.w_ffn_down[layer], 1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
+        logits_in->debug("11_linear_out_logits_in.txt");
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
@@ -255,13 +290,22 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
+
+        std::exit(0);
     }
     // Sample and Output
     if (idev == 0) {
         if (last_logits != nullptr) {
+            logits_in->debug("12_rms_norm_in_logits_in.txt");
+            rsrc.w_out_norm->debug("12_rms_norm_in_w_out_norm.txt");
             rmsnorm(logits_out, logits_in, rsrc.w_out_norm, meta.epsilon);
+            logits_out->debug("12_rms_norm_out_logits_out.txt");
+
             auto last_logits_buf = Tensor::buffer(dt_logits, {ntok, dvoc}, rsrc.memory_pool);
+            logits_out->debug("13_linear_in_logits_out.txt");
+            rsrc.w_out_embd->debug("13_linear_in_w_out_embd.txt");
             linear(last_logits_buf, logits_out, rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
+            last_logits_buf->debug("13_linear_out_last_logits_buf.txt");
             RUN_INFINI(infinirtStreamSynchronize(stream));
             RUN_INFINI(infinirtMemcpy(last_logits, last_logits_buf->data(), dsize(dt_logits) * ntok * dvoc, INFINIRT_MEMCPY_D2H));
         }
@@ -270,21 +314,30 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
             for (uint32_t req = 0; req < nreq; req++) {
                 auto seq_len = req_lens[req];
                 token_offset += seq_len;
+                logits_in->slice(0, token_offset - 1, 1)->debug("14_rms_norm_in_logits_in.txt");
+                rsrc.w_out_norm->debug("14_rms_norm_in_w_out_norm.txt");
                 rmsnorm(logits_out->slice(0, req, 1),
                         logits_in->slice(0, token_offset - 1, 1),
                         rsrc.w_out_norm,
                         meta.epsilon);
+                logits_out->slice(0, req, 1)->debug("14_rms_norm_out_logits_out.txt");
             }
+            logits_out->slice(0, 0, nreq)->debug("15_linear_in_logits_out.txt");
+            rsrc.w_out_embd->debug("15_linear_in_w_out_embd.txt");
             linear(prob_buf, logits_out->slice(0, 0, nreq), rsrc.w_out_embd, 1.0, 0.0, nullptr, nullptr);
+            prob_buf->debug("15_linear_out_prob_buf.txt");
+
             std::random_device _rd;
             std::mt19937 gen(_rd());
             token_offset = 0;
             for (uint32_t req = 0; req < nreq; req++) {
                 auto seq_len = req_lens[req];
                 float random_val = std::uniform_real_distribution<float>(0, 1)(gen);
+                prob_buf->slice(0, req, 1)->view_as({dvoc}, {1})->debug("16_randomSample_in_prob_buf.txt");
                 randomSample(result_buf->slice(0, req, 1)->view_as({}, {}),
                              prob_buf->slice(0, req, 1)->view_as({dvoc}, {1}),
                              random_val, topp[req], topk[req], temperature[req]);
+                result_buf->slice(0, req, 1)->view_as({}, {})->debug("16_randomSample_out_result_buf.txt");
                 token_offset += seq_len;
             }
             RUN_INFINI(infinirtStreamSynchronize(stream));
@@ -299,11 +352,11 @@ void inferDeviceBatch(const JiugeMeta &meta, JiugeDeviceResource &rsrc,
 
 __C void
 inferBatchJiuge(struct JiugeModel *model,
-           const uint32_t *tokens, uint32_t ntok,
-           const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-           struct KVCache **kv_caches,
-           const float *temperature, const uint32_t *topk, const float *topp,
-           uint32_t *output) {
+                const uint32_t *tokens, uint32_t ntok,
+                const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                struct KVCache **kv_caches,
+                const float *temperature, const uint32_t *topk, const float *topp,
+                uint32_t *output) {
     model->req.tokens = tokens;
     model->req.ntok = ntok;
     model->req.req_lens = req_lens;
@@ -332,10 +385,10 @@ inferBatchJiuge(struct JiugeModel *model,
 
 __C void
 forwardBatchJiuge(struct JiugeModel *model,
-             const uint32_t *tokens, uint32_t ntok,
-             const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-             struct KVCache **kv_caches,
-             void *logits) {
+                  const uint32_t *tokens, uint32_t ntok,
+                  const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                  struct KVCache **kv_caches,
+                  void *logits) {
     model->req.tokens = tokens;
     model->req.ntok = ntok;
     model->req.req_lens = req_lens;
